@@ -18,7 +18,7 @@ accounts.txt 每行一个号：
 脚本会自动：推 frida-server、推 BillingClient 模块、查 offer、用 eft-12month 拉起收银台，
 只有在确认金额为 0 时才点「订阅」。
 """
-import argparse, base64, hashlib, hmac, json, os, re, select, struct, subprocess, sys, threading, time
+import argparse, base64, hashlib, hmac, json, os, re, select, shlex, struct, subprocess, sys, threading, time
 from pathlib import Path
 
 # 人工确认闸门：网页版点「我已完成，继续」，命令行按回车
@@ -115,9 +115,16 @@ def pick_device():
     ok(f"设备已连接：{SERIAL}")
 
 
+def root_sh(command: str, timeout=60):
+    """兼容已 root 的 adbd（新版 MuMu 没有 su）和通过 su 提权的设备。"""
+    if "uid=0" in sh("shell", "id", timeout=15):
+        return sh("shell", command, timeout=timeout)
+    return sh("shell", "su -c " + shlex.quote(command), timeout=timeout)
+
+
 def ensure_root():
     try:
-        uid = sh("shell", "su -c id", timeout=15)
+        uid = root_sh("id", timeout=15)
     except Exception:
         uid = ""
     if "uid=0" not in uid:
@@ -144,7 +151,7 @@ def ensure_frida_server():
         raw = Path("/tmp/frida-server")
         sh("push", str(raw), FRIDA_REMOTE, timeout=120)
         sh("shell", f"chmod 755 {FRIDA_REMOTE}")
-    sh("shell", f"su -c 'nohup {FRIDA_REMOTE} -D >/dev/null 2>&1 &'", timeout=15)
+    root_sh(f"nohup {FRIDA_REMOTE} -D >/dev/null 2>&1 &", timeout=15)
     for _ in range(20):
         time.sleep(0.5)
         if "frida-server" in sh("shell", "ps -A | grep frida-server || true"):
@@ -243,14 +250,19 @@ def totp(secret: str, digits=6, period=30) -> str:
 
 # ---------- 账号 ----------
 def accounts_on_device() -> list:
+    """读取实际 Google 账号邮箱，排除 dumpsys 中的认证服务信息。"""
     out = sh("shell", "dumpsys account | grep 'type=com.google'")
-    return out.splitlines()
+    return [name.strip().lower() for name in re.findall(
+        r"Account\s*\{name=([^,}]+),\s*type=com\.google\s*\}", out)]
 
 
 def add_account(email, password, totp_secret="") -> bool:
     """把账号加到手机。没有 2FA 也能走；卡住时交给人处理。"""
+    want = email.strip().lower()
+    if want in accounts_on_device():
+        ok("目标账号已登录，跳过添加账号")
+        return True
     step(f"把账号加到手机：{email}")
-    before = len(accounts_on_device())
     sh("shell", "am start -a android.settings.ADD_ACCOUNT_SETTINGS")
     time.sleep(3)
     tap_text("Google", exact=True) or tap_text("Google")
@@ -280,15 +292,18 @@ def add_account(email, password, totp_secret="") -> bool:
     # 逐步推进：已知界面自动点，未知/验证界面交给人
     unknown_rounds = 0
     for _ in range(90):
-        if len(accounts_on_device()) > before:
+        if want in accounts_on_device():
             ok("账号已加入设备")
             return True
         xml = ui_xml()
         text = " ".join(n["text"] for n in nodes(xml) if n["text"])
 
         if "此账号已在您的设备上" in text or "already on your device" in text.lower():
-            ok("账号已在设备上")
-            return True
+            if want in accounts_on_device():
+                ok("目标账号已在设备上")
+                return True
+            warn("页面提示账号已存在，但未检测到目标邮箱")
+            return False
         if "找不到此账号" in text or "Couldn't find your Google Account" in text:
             warn("Google 说找不到这个账号（检查邮箱拼写）")
             return False
@@ -323,7 +338,7 @@ def add_account(email, password, totp_secret="") -> bool:
             unknown_rounds = 0
         time.sleep(2)
 
-    if len(accounts_on_device()) > before:
+    if want in accounts_on_device():
         ok("账号已加入设备")
         return True
     warn("加号超时")
@@ -430,28 +445,77 @@ def build_js(plan: str = "auto") -> str:
 def run_trial(pid: int, wait=90, plan="auto") -> dict:
     import frida
     step("注入计费模块，查询免费试用")
-    dev = frida.get_usb_device(timeout=10)
-    sess = dev.attach(pid)
-    res = {"offers": [], "launched": None, "purchase": None, "errors": []}
+    res = {"offers": [], "launched": None, "purchase": None, "errors": [],
+           "events": [], "no_trial": False, "timed_out": False}
+    done = threading.Event()
+    lock = threading.Lock()
+    active = True
+    sess = sc = None
 
     def on_msg(m, _):
+        nonlocal active
+        with lock:
+            if active:
+                record_message(m)
+
+    def record_message(m):
+        if m.get("type") == "error":
+            res["errors"].append({"ev": "frida_error", "m": m.get("description", ""),
+                                  "stack": m.get("stack", "")})
+            done.set()
+            return
         p = m.get("payload") or {}
+        if not isinstance(p, dict):
+            return
         ev = p.get("ev")
+        if ev:
+            res["events"].append(p)
         if ev == "offer":
             res["offers"].append(p)
             note(f"offer {p.get('id')} → {p.get('micros')} ({p.get('p0','')})")
         elif ev == "launched":
             res["launched"] = p
             ok(f"已拉起收银台：{p}")
+            done.set()
         elif ev == "purchase_cb":
             res["purchase"] = p
-        elif ev and ("err" in ev or ev.startswith("no_")):
+        elif ev == "no_trial":
+            res["no_trial"] = True
+            done.set()
+        elif ev in ("setup", "pd") and p.get("code") != 0:
             res["errors"].append(p)
+            done.set()
+        elif ev == "disc" or (ev and ("err" in ev or ev == "no_activity")):
+            res["errors"].append(p)
+            done.set()
 
-    sc = sess.create_script(build_js(plan))
-    sc.on("message", on_msg)
-    sc.load()
-    time.sleep(wait)
+    try:
+        source = build_js(plan)
+        if int(frida.__version__.split(".")[0]) >= 17:
+            bridge = Path(__file__).resolve().parent / "assets" / "frida" / "java-bridge.js"
+            source = bridge.read_text(encoding="utf-8") + "\n" + source
+        dev = frida.get_usb_device(timeout=10)
+        sess = dev.attach(pid)
+        sc = sess.create_script(source)
+        sc.on("message", on_msg)
+        sc.load()
+        done.wait(wait)
+        with lock:
+            active = False
+            res["timed_out"] = not done.is_set()
+    except Exception as e:
+        with lock:
+            active = False
+            res["errors"].append({"ev": "injection_error", "m": str(e)})
+    finally:
+        with lock:
+            active = False
+        for resource, method in ((sc, "unload"), (sess, "detach")):
+            if resource is not None:
+                try:
+                    getattr(resource, method)()
+                except Exception as e:
+                    res["errors"].append({"ev": "cleanup_error", "m": str(e)})
     return res
 
 
@@ -556,6 +620,10 @@ def process(email, password="", totp_secret="", add=True, card=None, plan="auto"
     elif not switch_play(email):
         rec["status"] = "play_account_switch_failed"
         return rec
+    if not sh("shell", f"pm path {PKG}").startswith("package:"):
+        warn("未安装 Google One，请先在 Play 商店安装后重试")
+        rec["status"] = "app_not_installed"
+        return rec
     pid = launch_app()
     if not pid:
         rec["status"] = "app_not_started"
@@ -566,8 +634,14 @@ def process(email, password="", totp_secret="", add=True, card=None, plan="auto"
         rec["sheet"] = confirm_zero(password=password)
         rec["subscription_page"] = verify()
         rec["status"] = "subscribed" if "Ultra" in rec["subscription_page"] else "launched"
+    elif fr["errors"]:
+        rec["status"] = "injection_failed"
+    elif fr.get("no_trial"):
+        rec["status"] = "no_trial"
+    elif fr.get("timed_out"):
+        rec["status"] = "query_timeout"
     else:
-        rec["status"] = "launch_failed"
+        rec["status"] = "billing_launch_failed"
     return rec
 
 
@@ -741,7 +815,8 @@ function query(){
   var PL=Java.registerClass({name:"rc.C"+Date.now(), implements:[PDL], methods:{
     onProductDetailsResponse:function(res,list){
       S({ev:"pd", code:res.getResponseCode(), n:(list?list.size():0)});
-      if(res.getResponseCode()!==0 || !list || list.size()===0) return;
+      if(res.getResponseCode()!==0) return;
+      if(!list || list.size()===0){ S({ev:"no_trial", reason:"no_products"}); return; }
       L(dexLoader);
       var PD=Java.use("com.android.billingclient.api.ProductDetails");
       var SOD=Java.use("com.android.billingclient.api.ProductDetails$SubscriptionOfferDetails");
@@ -807,7 +882,7 @@ function launch(pd, offer){
   Handler.$new(Looper.getMainLooper()).post(R.$new());
  }catch(e){ S({ev:"launch_outer_err", m:String(e).slice(0,200)}); }
 }
-var iv=setInterval(function(){ try{ L(null); var a=Java.use("android.app.ActivityThread").currentApplication(); if(a){clearInterval(iv); boot();} }catch(e){} },400);
+var iv=setInterval(function(){ try{ L(null); var a=Java.use("android.app.ActivityThread").currentApplication(); if(a){clearInterval(iv); boot();} }catch(e){clearInterval(iv); S({ev:"boot_err", m:String(e).slice(0,200)});} },400);
 
 '''
 

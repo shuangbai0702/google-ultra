@@ -182,10 +182,39 @@ MUMU_ADB_WIN = [
 ]
 
 
+def _installed_mumu_adb():
+    """从 Windows 卸载注册表读取 MuMu 安装位置，支持自定义盘符和新版目录。"""
+    import winreg
+
+    locations = (
+        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
+        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"),
+        (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
+    )
+    for hive, key_path in locations:
+        try:
+            with winreg.OpenKey(hive, key_path) as uninstall:
+                for index in range(winreg.QueryInfoKey(uninstall)[0]):
+                    try:
+                        with winreg.OpenKey(uninstall, winreg.EnumKey(uninstall, index)) as app:
+                            name = winreg.QueryValueEx(app, "DisplayName")[0]
+                            if "mumu" not in name.lower():
+                                continue
+                            root = Path(winreg.QueryValueEx(app, "InstallLocation")[0])
+                        yield str(root / "nx_main" / "adb.exe")
+                        yield str(root / "shell" / "adb.exe")
+                        yield from (str(p) for p in root.glob("nx_device/*/shell/adb.exe"))
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+
+
 def discover_adb():
     """跨平台找 adb：Windows 优先 MuMu 自带的，再找 PATH / SDK；Mac 用 ultra0 的候选。"""
     cands = []
     if IS_WIN:
+        cands += _installed_mumu_adb()
         cands += MUMU_ADB_WIN
         cands.append(os.path.expanduser(r"~\AppData\Local\Android\Sdk\platform-tools\adb.exe"))
     else:
@@ -197,8 +226,9 @@ def discover_adb():
     for cpath in cands:
         if cpath and (cpath in ("adb", "adb.exe") or Path(cpath).exists()):
             try:
-                subprocess.run([cpath, "version"], capture_output=True, timeout=5)
-                return cpath
+                result = subprocess.run([cpath, "version"], capture_output=True, timeout=5)
+                if result.returncode == 0:
+                    return cpath
             except Exception:
                 continue
     return None
@@ -351,7 +381,7 @@ def start_frida_server() -> bool:
             return False
         _adb("push", str(raw_path), ultra0.FRIDA_REMOTE, timeout=120)
         _adb("shell", f"chmod 755 {ultra0.FRIDA_REMOTE}")
-    _adb("shell", f"su -c 'nohup {ultra0.FRIDA_REMOTE} -D >/dev/null 2>&1 &'", timeout=15)
+    ultra0.root_sh(f"nohup {ultra0.FRIDA_REMOTE} -D >/dev/null 2>&1 &", timeout=15)
     for _ in range(20):
         time.sleep(0.5)
         if _frida_running():
@@ -506,8 +536,13 @@ STATUS_CN = {
     "add_account_error": "加号出错，手动登录后重试",
     "wrong_account": "Play 没切到这个号，手动切好后用高级模式 --no-switch 重试",
     "play_account_switch_failed": "切 Play 账号失败，手动切好再重试",
-    "app_not_started": "Google One 没启动起来，重试一次",
-    "launch_failed": "没查到可用的免费 offer，换个号",
+    "app_not_installed": "未安装 Google One，请先在 Play 商店安装后重试",
+    "app_not_started": "Google One 已安装但未启动成功，请在模拟器中手动打开检查",
+    "launch_failed": "旧报告未区分技术错误与无优惠，请更新脚本后重试",
+    "injection_failed": "注入或计费调用失败，请查看报告 errors；不能据此判断资格",
+    "query_timeout": "计费查询超时，未收到完整结果；不能据此判断资格",
+    "no_trial": "计费查询完成，未返回可用免费优惠",
+    "billing_launch_failed": "查询后收银台启动失败，请查看报告 launched",
 }
 
 
